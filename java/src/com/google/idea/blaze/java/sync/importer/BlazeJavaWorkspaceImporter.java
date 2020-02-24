@@ -15,6 +15,11 @@
  */
 package com.google.idea.blaze.java.sync.importer;
 
+import static com.google.common.collect.ImmutableList.toImmutableList;
+import static com.google.common.collect.ImmutableMap.toImmutableMap;
+import static com.google.common.util.concurrent.Futures.allAsList;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
+import static java.util.stream.Collectors.toList;
 
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.ImmutableList;
@@ -24,6 +29,8 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
+import com.google.common.util.concurrent.FluentFuture;
+import com.google.common.util.concurrent.ListenableFuture;
 import com.google.devtools.intellij.ideinfo.IntellijIdeInfo.Dependency.DependencyType;
 import com.google.idea.blaze.base.ideinfo.ArtifactLocation;
 import com.google.idea.blaze.base.ideinfo.Dependency;
@@ -34,6 +41,7 @@ import com.google.idea.blaze.base.ideinfo.TargetKey;
 import com.google.idea.blaze.base.ideinfo.TargetMap;
 import com.google.idea.blaze.base.model.LibraryKey;
 import com.google.idea.blaze.base.model.primitives.WorkspaceRoot;
+import com.google.idea.blaze.base.prefetch.FetchExecutor;
 import com.google.idea.blaze.base.projectview.ProjectViewSet;
 import com.google.idea.blaze.base.scope.BlazeContext;
 import com.google.idea.blaze.base.scope.output.PrintOutput;
@@ -53,6 +61,7 @@ import com.google.idea.blaze.java.sync.source.SourceArtifact;
 import com.google.idea.blaze.java.sync.source.SourceDirectoryCalculator;
 import com.google.idea.blaze.java.sync.workingset.JavaWorkingSet;
 import com.intellij.openapi.project.Project;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
@@ -60,7 +69,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.stream.Collectors;
+import java.util.concurrent.ExecutionException;
+import java.util.function.Function;
 import javax.annotation.Nullable;
 
 /** Builds a BlazeWorkspace. */
@@ -137,8 +147,7 @@ public final class BlazeJavaWorkspaceImporter {
     return new BlazeJavaImportResult(
         contentEntries,
         libraries,
-        ImmutableList.copyOf(
-            workspaceBuilder.buildOutputJars.stream().sorted().collect(Collectors.toList())),
+        workspaceBuilder.buildOutputJars.stream().sorted().collect(toImmutableList()),
         ImmutableSet.copyOf(workspaceBuilder.addedSourceFiles),
         sourceVersion);
   }
@@ -166,9 +175,7 @@ public final class BlazeJavaWorkspaceImporter {
       List<LibraryArtifact> allJars = Lists.newArrayList();
       allJars.addAll(javaIdeInfo.getJars());
       Collection<BlazeJarLibrary> libraries =
-          allJars.stream()
-              .map(jar -> new BlazeJarLibrary(jar, target.getKey()))
-              .collect(Collectors.toList());
+          allJars.stream().map(jar -> new BlazeJarLibrary(jar, target.getKey())).collect(toList());
 
       targetKeyToLibrary.putAll(target.getKey(), libraries);
       for (BlazeJarLibrary library : libraries) {
@@ -218,7 +225,41 @@ public final class BlazeJavaWorkspaceImporter {
       result.put(library.key, library);
     }
 
-    return ImmutableMap.copyOf(result);
+    // Filter out any libraries corresponding to empty jars
+    return EmptyLibraryFilter.isEnabled()
+        ? removeEmptyLibraries(artifactLocationDecoder, result)
+        : ImmutableMap.copyOf(result);
+  }
+
+  /**
+   * Filters out any libraries from the given map that correspond to effectively empty JARs. See
+   * {@link EmptyLibraryFilter}.
+   */
+  private static ImmutableMap<LibraryKey, BlazeJarLibrary> removeEmptyLibraries(
+      ArtifactLocationDecoder locationDecoder, Map<LibraryKey, BlazeJarLibrary> allLibraries) {
+    EmptyLibraryFilter emptyLibraryFilter = new EmptyLibraryFilter(locationDecoder);
+    ArrayList<ListenableFuture<Map.Entry<LibraryKey, Boolean>>> nonemptyFutures =
+        new ArrayList<>(allLibraries.size());
+    allLibraries.forEach(
+        (key, library) ->
+            nonemptyFutures.add(
+                FetchExecutor.EXECUTOR.submit(
+                    () -> Maps.immutableEntry(key, emptyLibraryFilter.test(library)))));
+
+    ListenableFuture<ImmutableMap<LibraryKey, BlazeJarLibrary>> nonemptyLibraries =
+        FluentFuture.from(allAsList(nonemptyFutures))
+            .transform(
+                results ->
+                    results.stream()
+                        .filter(Map.Entry::getValue)
+                        .map(Map.Entry::getKey)
+                        .collect(toImmutableMap(Function.identity(), allLibraries::get)),
+                directExecutor());
+    try {
+      return nonemptyLibraries.get();
+    } catch (ExecutionException | InterruptedException e) {
+      return ImmutableMap.copyOf(allLibraries);
+    }
   }
 
   private void addLibraryToJdeps(
@@ -262,9 +303,7 @@ public final class BlazeJavaWorkspaceImporter {
         if (depTarget != null
             && JavaBlazeRules.getJavaProtoLibraryKinds().contains(depTarget.getKind())) {
           workspaceBuilder.directDeps.addAll(
-              depTarget.getDependencies().stream()
-                  .map(Dependency::getTargetKey)
-                  .collect(Collectors.toList()));
+              depTarget.getDependencies().stream().map(Dependency::getTargetKey).collect(toList()));
         } else {
           workspaceBuilder.directDeps.add(dep.getTargetKey());
         }
@@ -292,7 +331,7 @@ public final class BlazeJavaWorkspaceImporter {
     workspaceBuilder.generatedJarsFromSourceTargets.addAll(
         javaIdeInfo.getGeneratedJars().stream()
             .map(jar -> new BlazeJarLibrary(jar, targetKey))
-            .collect(Collectors.toList()));
+            .collect(toList()));
     if (javaIdeInfo.getFilteredGenJar() != null) {
       workspaceBuilder.generatedJarsFromSourceTargets.add(
           new BlazeJarLibrary(javaIdeInfo.getFilteredGenJar(), targetKey));
