@@ -38,7 +38,6 @@ import com.google.idea.blaze.base.scope.BlazeContext;
 import com.google.idea.blaze.base.scope.output.IssueOutput;
 import com.google.idea.blaze.base.sync.BlazeSyncManager;
 import com.google.idea.blaze.base.sync.BlazeSyncPlugin;
-import com.google.idea.blaze.base.sync.GenericSourceFolderProvider;
 import com.google.idea.blaze.base.sync.SourceFolderProvider;
 import com.google.idea.blaze.base.sync.projectview.WorkspaceLanguageSettings;
 import com.google.idea.blaze.python.projectstructure.PythonSourceFolderProvider;
